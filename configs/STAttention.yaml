@@ -11,7 +11,7 @@ METRLA:
   
   lr: 0.001
   weight_decay: 0.0001
-  milestones: [10, 50]
+  milestones: [40]
   lr_decay_rate: 0.1
   batch_size: 64
   max_epochs: 200
@@ -30,7 +30,7 @@ METRLA:
     tod_embedding_dim: 12
     dow_embedding_dim: 12
     adaptive_embedding_dim: 60
-    feed_forward_dim: 192
+    feed_forward_dim: 128
     num_heads: 4
     num_layers: 3
     dropout: 0.1
