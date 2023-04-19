@@ -133,7 +133,6 @@ class STMetaGCN(nn.Module):
             support = torch.einsum('ij,bjp->bip', [G[k,:,:], x]) # B N C_IN
             support_list.append(support)
         support_cat = torch.cat(support_list, dim=-1) # B N cheb_k*C_IN
-
         output = torch.einsum('bnp,bnph->bnh', [support_cat, self.W]) + self.b # [B, N, H_out]
 
         return output
@@ -210,7 +209,10 @@ class STMetaGCRUEncoder(nn.Module):
             nn.Linear(learner_hidden_dim, gru_hidden_dim),
         )
 
-    def forward(self, G, x, meta_input):
+    def set_weights(self, W_conv_gate, b_conv_gate, W_update, b_update):
+        self.cell.set_weights(W_conv_gate, b_conv_gate, W_update, b_update)
+
+    def forward(self, G, x):
         # G            (K, N, N)
         # x            (B, T_in, N, input_dim)
         # meta_input   (B, N, st_embedding_dim+z_dim)  
@@ -219,26 +221,11 @@ class STMetaGCRUEncoder(nn.Module):
         in_steps = x.shape[1]
         num_nodes = x.shape[2]    
 
-        W_conv_gate = self.learner_w_conv_gate(meta_input).view(
-            batch_size, num_nodes, self.cheb_k * (self.input_dim + self.gru_hidden_dim), 2 * self.gru_hidden_dim
-        )
-        b_conv_gate = self.learner_b_conv_gate(meta_input).view(
-            batch_size, num_nodes, 2 * self.gru_hidden_dim
-        )
-        W_update = self.learner_w_update(meta_input).view(
-            batch_size, num_nodes, self.cheb_k * (self.input_dim + self.gru_hidden_dim), self.gru_hidden_dim
-        )
-        b_update = self.learner_b_update(meta_input).view(
-            batch_size, num_nodes, self.gru_hidden_dim
-        )     
-
-        self.cell.set_weights(W_conv_gate, b_conv_gate, W_update, b_update)
-
         h = torch.zeros(batch_size, num_nodes, self.gru_hidden_dim, device=x.device) 
 
         h_each_step = []
         for t in range(in_steps):
-            h = self.cell(G, x[:, t, ...], h)  # (B, N, 1, gru_hidden_dim)
+            h = self.cell(G, x[:, t, ...], h)  # (B, N, gru_hidden_dim)
             h_each_step.append(h.squeeze(dim=2))  # T_in*(B, N, gru_hidden_dim)    
 
         h_each_step = torch.stack(
@@ -247,6 +234,142 @@ class STMetaGCRUEncoder(nn.Module):
 
         return h_each_step, h.squeeze(dim=2)
     
+
+class GCN(nn.Module):
+    def __init__(self, dim_in, dim_out, cheb_k):
+        super(GCN, self).__init__()
+        self.cheb_k = cheb_k
+        self.dim_in = dim_in
+        self.W = nn.Parameter(torch.empty(cheb_k * dim_in, dim_out), requires_grad=True)
+        self.b = nn.Parameter(torch.empty(dim_out), requires_grad=True)
+        nn.init.xavier_normal_(self.W)
+        nn.init.constant_(self.b, val=0)
+
+    def forward(self, G, x):
+        """
+        :param x: graph feature/signal          -   [B, N, C + H_in] input concat last step's hidden
+        :param G: support adj matrices          -   [K, N, N]
+        :return output: hidden representation   -   [B, N, H_out]
+        """
+        support_list = []
+        for k in range(self.cheb_k):
+            support = torch.einsum(
+                "ij,bjp->bip", G[k, :, :], x
+            )  # [B, N, C + H_in] perform GCN
+            support_list.append(support)  # k * [B, N, C + H_in]
+        support_cat = torch.cat(support_list, dim=-1)  # [B, N, k * (C + H_in)]
+        output = (
+            torch.einsum("bip,pq->biq", support_cat, self.W) + self.b
+        )  # [B, N, H_out]
+        return output
+
+
+class GRUCell(nn.Module):
+    def __init__(self, num_nodes, dim_in, dim_hidden, cheb_k):
+        super(GRUCell, self).__init__()
+        self.num_nodes = num_nodes
+        self.dim_in = dim_in
+        self.dim_hidden = dim_hidden
+
+        self.gate = GCN(
+            cheb_k=cheb_k, dim_in=dim_in + dim_hidden, dim_out=2 * dim_hidden
+        )
+        self.update = GCN(cheb_k=cheb_k, dim_in=dim_in + dim_hidden, dim_out=dim_hidden)
+
+    def forward(self, G, x_t, h_pre):
+        """
+        :param G: support adj matrices      -   [K, N, N]
+        :param x_t: graph feature/signal    -   [B, N, C]
+        :param h_pre: previous hidden state -   [B, N, H]
+        :return h_t: current hidden state   -   [B, N, H]
+        """
+        combined = torch.cat([x_t, h_pre], dim=-1)  # concat input and last hidden
+        z_r = torch.sigmoid(self.gate(G, combined))  # [B, N, 2 * H]
+        z, r = torch.split(z_r, self.dim_hidden, dim=-1)
+        candidate = torch.cat([x_t, r * h_pre], dim=-1)
+        n = torch.tanh(self.update(G, candidate))
+        h_t = z * n + (1 - z) * h_pre  # [B, N, H]
+
+        return h_t
+
+    def init_hidden(self, batch_size: int):
+        weight = next(self.parameters()).data
+        h = weight.new_zeros(batch_size, self.num_nodes, self.dim_hidden)
+        return h
+
+
+class Decoder(nn.Module):
+    """
+    First iter on each layer, get cur step's pred, then feed back to pred next step.
+    """
+
+    def __init__(self, num_nodes, dim_out, dim_hidden, cheb_k, num_layers=1):
+        super(Decoder, self).__init__()
+        self.num_nodes = num_nodes
+        self.dim_out = dim_out
+        self.dim_hidden = dim_hidden
+        self.num_layers = num_layers
+        self.cell_list = nn.ModuleList()
+        for i in range(self.num_layers):
+            cur_input_dim = self.dim_out if i == 0 else self.dim_hidden
+            self.cell_list.append(
+                GRUCell(
+                    num_nodes=num_nodes,
+                    dim_in=cur_input_dim,
+                    dim_hidden=self.dim_hidden,
+                    cheb_k=cheb_k,
+                )
+            )
+
+    def forward(self, G, x_t, h):
+        """
+        :param G: support adj matrices                              -   [K, N, N]
+        :param x_t: graph feature/signal                            -   [B, N, C]
+        :param h: previous hidden state from the last encoder cell  -   num_layers * [B, N, H]
+        :return output: the last hidden state                       -   [B, N, H]
+        :return h_lst: hidden state of each layer                   -   num_layers * [B, N, H]
+        """
+        current_inputs = x_t
+        h_lst = []  # each layer's h for this step
+        for i in range(self.num_layers):
+            h_t = self.cell_list[i](G, current_inputs, h[i])
+            h_lst.append(h_t)  # num_layers * [B, N, H]
+            current_inputs = h_t  # input for next layer
+        output = current_inputs
+        return output, h_lst
+
+
+class STMetaGCRUDecoder(nn.Module):
+    def __init__(
+            self, 
+            cheb_k=3,
+            input_dim=64,
+            gru_hidden_dim=64,
+            st_embedding_dim=95,
+            learner_hidden_dim=128,
+            z_dim=32,):
+        super(STMetaGCRUDecoder, self).__init__()
+        self.cheb_k = cheb_k
+        self.input_dim = input_dim
+        self.gru_hidden_dim = gru_hidden_dim
+        self.st_embedding_dim = st_embedding_dim
+        self.learner_hidden_dim = learner_hidden_dim
+        self.z_dim = z_dim
+
+        self.cell = STMetaGCRUCell(cheb_k=cheb_k, gru_hidden_dim=gru_hidden_dim)
+
+    def set_weights(self, W_conv_gate, b_conv_gate, W_update, b_update):
+        self.cell.set_weights(W_conv_gate, b_conv_gate, W_update, b_update)
+
+    def forward(self, G, x, h):
+        # G            (K, N, N)
+        # x            (B, N, input_dim)
+        # meta_input   (B, N, st_embedding_dim+z_dim)  
+
+        h = self.cell(G, x, h)    
+
+        return h, h.squeeze(dim=2)
+
 
 class STMetaGCRU(nn.Module):
     def __init__(
@@ -320,8 +443,32 @@ class STMetaGCRU(nn.Module):
                     z_dim,
                 )
             )
-
-        self.decoder = nn.Linear(gru_hidden_dim, out_steps * output_dim)
+        if seq2seq:
+            # self.decoders = nn.ModuleList(
+            #     [
+            #         STMetaGCRUCell(
+            #             self.P.shape[0],
+            #             gru_hidden_dim,
+            #         )
+            #     ]
+            # )
+            # for _ in range(num_layers - 1):
+            #     self.decoders.append(
+            #         STMetaGCRUCell(
+            #             self.P.shape[0],
+            #             gru_hidden_dim,
+            #         )
+            #     )
+            self.decoder = Decoder(
+                num_nodes=self.num_nodes,
+                dim_out=self.output_dim,
+                dim_hidden=self.gru_hidden_dim,
+                cheb_k=self.P.shape[0],
+                num_layers=self.num_layers,
+            )
+            self.proj = nn.Sequential(nn.Linear(self.gru_hidden_dim, self.output_dim))
+        else:
+            self.decoder = nn.Linear(gru_hidden_dim, out_steps * output_dim)
 
         if self.z_dim > 0:
             self.mu = nn.Parameter(torch.randn(num_nodes, z_dim), requires_grad=True)
@@ -343,6 +490,30 @@ class STMetaGCRU(nn.Module):
                 nn.Linear(32, 32),
                 nn.Tanh(),
                 nn.Linear(32, z_dim),
+            )
+
+            self.learner_w_conv_gate = nn.Sequential(
+            nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(learner_hidden_dim, self.P.shape[0] * (input_dim + gru_hidden_dim) * 2 * gru_hidden_dim),
+            )
+
+            self.learner_b_conv_gate = nn.Sequential(
+                nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(learner_hidden_dim, 2 * gru_hidden_dim),
+            )
+
+            self.learner_w_update = nn.Sequential(
+                nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(learner_hidden_dim, self.P.shape[0] * (input_dim + gru_hidden_dim) * gru_hidden_dim),
+            )
+
+            self.learner_b_update = nn.Sequential(
+                nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(learner_hidden_dim, gru_hidden_dim),
             )
 
     def compute_cheby_poly(self, P: list):
@@ -370,6 +541,7 @@ class STMetaGCRU(nn.Module):
         spatial: N64 -> broadcast -> BN64
         """
         batch_size = x.shape[0]
+        num_nodes = x.shape[2] 
 
         tod = x[..., 1]  # (B, T_in, N)
         dow = x[..., 2]  # (B, T_in, N)
@@ -401,22 +573,55 @@ class STMetaGCRU(nn.Module):
                 [meta_input, z_data], dim=-1
             )  # (B, N, st_emb_dim+z_dim)
 
+        W_conv_gate = self.learner_w_conv_gate(meta_input).view(
+            batch_size, num_nodes, self.P.shape[0] * (self.input_dim + self.gru_hidden_dim), 2 * self.gru_hidden_dim
+        )
+        b_conv_gate = self.learner_b_conv_gate(meta_input).view(
+            batch_size, num_nodes, 2 * self.gru_hidden_dim
+        )
+        W_update = self.learner_w_update(meta_input).view(
+            batch_size, num_nodes, self.P.shape[0] * (self.input_dim + self.gru_hidden_dim), self.gru_hidden_dim
+        )
+        b_update = self.learner_b_update(meta_input).view(
+            batch_size, num_nodes, self.gru_hidden_dim
+        )  
+
+        for encoder in self.encoders:
+            encoder.set_weights(W_conv_gate, b_conv_gate, W_update, b_update)
+
         gru_input = x  # (B, T_in, N, 1)
         h_each_layer = []  # last step's h of each layer
         for encoder in self.encoders:
-            gru_input, last_h = encoder(self.P, gru_input, meta_input)
+            gru_input, last_h = encoder(self.P, gru_input)
 
             h_each_layer.append(last_h)  # num_layers*(B, N, gru_hidden_dim)
 
-        # TODO seq2seq
+        if self.seq2seq:
+            # for decoder in self.decoders:
+            #     decoder.set_weights(W_conv_gate, b_conv_gate, W_update, b_update)
+            deco_input = torch.zeros(
+                (x.shape[0], x.shape[2], x.shape[3]), device=x.device
+            )
+            out = []
+            # for t in range(self.out_steps):
+            #     for i in range(self.num_layers):
+            #         h_each_layer[i] = self.decoders[i](self.P, deco_input, h_each_layer[i])
+            #         deco_input = self.proj(h_each_layer[i])
+            #     out.append(deco_input)
+            for t in range(self.out_steps):
+                output, h_each_layer = self.decoder(self.P, deco_input, h_each_layer)
+                deco_input = self.proj(output)  # update decoder input
+                out.append(deco_input)  # T * [B, N, C]
+            out = torch.stack(out, dim=1)
+        else:
+            out = h_each_layer[-1]  # (B, N, gru_hidden_dim) last layer last step's h
 
-        out = h_each_layer[-1]  # (B, N, gru_hidden_dim) last layer last step's h
+            out = self.decoder(out).view(
+                batch_size, self.num_nodes, self.out_steps, self.output_dim
+            )  # (B, N, T_out, output_dim=1)
+            out = out.transpose(1, 2) # (B, T_out, N, 1)
 
-        out = self.decoder(out).view(
-            batch_size, self.num_nodes, self.out_steps, self.output_dim
-        )  # (B, N, T_out, output_dim=1)
-
-        return out.transpose(1, 2)  # (B, T_out, N, 1)
+        return out
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
