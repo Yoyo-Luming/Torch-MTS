@@ -120,6 +120,8 @@ class STMetaGCN(nn.Module):
         self.cheb_k = cheb_k
         self.W = nn.Parameter(torch.empty(cheb_k * dim_in, dim_out), requires_grad=True)
         self.b = nn.Parameter(torch.empty(dim_out), requires_grad=True)
+        nn.init.xavier_normal_(self.W)
+        nn.init.constant_(self.b, val=0)
         
     def set_attention(self, A):
         # A             (B, N, N)
@@ -132,10 +134,10 @@ class STMetaGCN(nn.Module):
         support_list = list()
         for k in range(self.cheb_k):
             support = torch.einsum('ij,bjp->bip', [G[k,:,:], x]) # B N C_IN
-            # print('support A:', support.shape, self.A.shape)
-            support = torch.einsum('bnc,bnn->bnc', [support, self.A])
+            support = torch.bmm(self.A, support)
             support_list.append(support)
         support_cat = torch.cat(support_list, dim=-1) # B N cheb_k*C_IN
+
         output = torch.einsum("bip,pq->biq", [support_cat, self.W]) + self.b # [B, N, H_out]
 
         return output
@@ -426,6 +428,7 @@ class STMetaAGCRU(nn.Module):
             self.decoders = nn.ModuleList(
                 [
                     STMetaGCRUCell(
+                        input_dim,
                         self.P.shape[0],
                         gru_hidden_dim,
                     )
@@ -434,6 +437,7 @@ class STMetaAGCRU(nn.Module):
             for _ in range(num_layers - 1):
                 self.decoders.append(
                     STMetaGCRUCell(
+                        gru_hidden_dim,
                         self.P.shape[0],
                         gru_hidden_dim,
                     )
@@ -517,7 +521,7 @@ class STMetaAGCRU(nn.Module):
         node_embedding = self.node_embedding.expand(
             batch_size, *self.node_embedding.shape
         )  # (B, N, node_emb_dim)
-
+        
         meta_input = torch.concat(
             [node_embedding, tod_embedding, dow_embedding], dim=-1
         )  # (B, N, st_emb_dim)
@@ -532,13 +536,15 @@ class STMetaAGCRU(nn.Module):
             z_data = z_data + self.reparameterize(
                 self.mu, self.logvar
             )  # temporal z + spatial z
-
+            
             meta_input = torch.concat(
                 [meta_input, z_data], dim=-1
             )  # (B, N, st_emb_dim+z_dim)
 
-        en_embeddings = self.en_attention_learner(meta_input) # B N H_L
-        en_attention = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [en_embeddings, en_embeddings.transpose(1, 2)])), dim=2) # B N N 
+        en_embeddings = self.en_attention_learner(meta_input) # B N learner_hidden_dim
+        # en_embeddings = meta_input
+
+        en_attention = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [en_embeddings, en_embeddings.transpose(1, 2)])), dim=-1) # B N N 
 
         for encoder in self.encoders:
             encoder.set_attention(en_attention)
@@ -551,8 +557,8 @@ class STMetaAGCRU(nn.Module):
             h_each_layer.append(last_h)  # num_layers*(B, N, gru_hidden_dim)
 
         if self.seq2seq:
-            de_embeddings = self.de_attention_learner(meta_input)
-            de_attention = F.softmax(F.relu(torch.einsum('bni,bjn->bij', [de_embeddings, de_embeddings.transpose(1, 2)])), dim=2)          
+            de_embeddings = self.de_attention_learner(meta_input) # B N learner_hidden_dim
+            de_attention = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [de_embeddings, de_embeddings.transpose(1, 2)])), dim=-1)          
             for decoder in self.decoders:
                 decoder.set_attention(de_attention)
             deco_input = torch.zeros(
@@ -561,8 +567,9 @@ class STMetaAGCRU(nn.Module):
             out = []
             for t in range(self.out_steps):
                 for i in range(self.num_layers):
-                    h_each_layer[i] = self.decoders[i](self.P, deco_input, h_each_layer[i])
-                    deco_input = self.proj(h_each_layer[i])
+                    deco_input = self.decoders[i](self.P, deco_input, h_each_layer[i])
+                    h_each_layer[i] = deco_input
+                deco_input = self.proj(h_each_layer[-1])
                 out.append(deco_input)
             # for t in range(self.out_steps):
             #     output, h_each_layer = self.decoder(self.P, deco_input, h_each_layer)
@@ -576,7 +583,6 @@ class STMetaAGCRU(nn.Module):
                 batch_size, self.num_nodes, self.out_steps, self.output_dim
             )  # (B, N, T_out, output_dim=1)
             out = out.transpose(1, 2) # (B, T_out, N, 1)
-        # print('out ',out.shape)
         return out
 
     def reparameterize(self, mu, logvar):
