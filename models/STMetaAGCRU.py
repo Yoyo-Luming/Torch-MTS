@@ -373,6 +373,7 @@ class STMetaAGCRU(nn.Module):
         num_layers=1,
         seq2seq=False,
         cheb_k=3,
+        addaptadj=False,
     ):
         super(STMetaAGCRU, self).__init__()
 
@@ -394,6 +395,13 @@ class STMetaAGCRU(nn.Module):
         adj = load_adj(adj_path, "pkl", adj_type)
         self.P = self.compute_cheby_poly(adj).to(device)  
 
+        self.addaptadj = addaptadj
+        self.supports_len = self.P.shape[0]
+        if self.addaptadj:
+            self.nodevec1 = nn.Parameter(torch.randn(num_nodes, 10).to(device), requires_grad=True).to(device)
+            self.nodevec2 = nn.Parameter(torch.randn(10, num_nodes).to(device), requires_grad=True).to(device)
+            self.supports_len +=1
+
         self.node_embedding = torch.FloatTensor(np.load(node_emb_file)["data"]).to(
             device
         )
@@ -404,7 +412,7 @@ class STMetaAGCRU(nn.Module):
         self.encoders = nn.ModuleList(
             [
                 STMetaGCRUEncoder(
-                    self.P.shape[0],
+                    self.supports_len,
                     input_dim,
                     gru_hidden_dim,
                     self.st_embedding_dim,
@@ -416,7 +424,7 @@ class STMetaAGCRU(nn.Module):
         for _ in range(num_layers - 1):
             self.encoders.append(
                 STMetaGCRUEncoder(
-                    self.P.shape[0],
+                    self.supports_len,
                     gru_hidden_dim,
                     gru_hidden_dim,
                     self.st_embedding_dim,
@@ -429,7 +437,7 @@ class STMetaAGCRU(nn.Module):
                 [
                     STMetaGCRUCell(
                         input_dim,
-                        self.P.shape[0],
+                        self.supports_len,
                         gru_hidden_dim,
                     )
                 ]
@@ -438,7 +446,7 @@ class STMetaAGCRU(nn.Module):
                 self.decoders.append(
                     STMetaGCRUCell(
                         gru_hidden_dim,
-                        self.P.shape[0],
+                        self.supports_len,
                         gru_hidden_dim,
                     )
                 )
@@ -551,8 +559,19 @@ class STMetaAGCRU(nn.Module):
 
         gru_input = x  # (B, T_in, N, 1)
         h_each_layer = []  # last step's h of each layer
+        new_support = self.P
+        # print('P shape', new_support.shape)
+        if self.addaptadj:
+            adp = F.softmax(F.relu(torch.mm(self.nodevec1, self.nodevec2)), dim=1)
+            # self.P = self.P + [adp]
+            adp = torch.unsqueeze(adp, 0)
+            # print('adp', adp.shape)
+            new_support = torch.cat((new_support, adp), 0)	
+
+        # print('P shape', new_support.shape)
+
         for encoder in self.encoders:
-            gru_input, last_h = encoder(self.P, gru_input)
+            gru_input, last_h = encoder(new_support, gru_input)
 
             h_each_layer.append(last_h)  # num_layers*(B, N, gru_hidden_dim)
 
@@ -567,7 +586,7 @@ class STMetaAGCRU(nn.Module):
             out = []
             for t in range(self.out_steps):
                 for i in range(self.num_layers):
-                    deco_input = self.decoders[i](self.P, deco_input, h_each_layer[i])
+                    deco_input = self.decoders[i](new_support, deco_input, h_each_layer[i])
                     h_each_layer[i] = deco_input
                 deco_input = self.proj(h_each_layer[-1])
                 out.append(deco_input)
