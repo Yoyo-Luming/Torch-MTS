@@ -13,7 +13,7 @@ METRLA:
   clip_grad: False
   batch_size: 64
   max_epochs: 200
-  use_cl: False
+  use_cl: True
   cl_step_size: 2500
 
   pass_device: True
@@ -34,12 +34,13 @@ METRLA:
     node_embedding_dim: 64
     learner_hidden_dim: 128
     z_dim: 64
-    num_layers: 2
+    num_layers: 3
     seq2seq: True
     cheb_k: 3
     add_01_adj: False
     add_meta_adj: True
     add_meta_att: False
+    use_adp_adj: False
 
 
 PEMSBAY:

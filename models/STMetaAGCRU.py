@@ -411,6 +411,7 @@ class STMetaAGCRU(nn.Module):
         add_01_adj=True,
         add_meta_adj=False,
         add_meta_att=False,
+        use_adp_adj=False,
 
     ):
         super(STMetaAGCRU, self).__init__()
@@ -434,6 +435,7 @@ class STMetaAGCRU(nn.Module):
         self.add_01_adj = add_01_adj
         self.add_meta_adj = add_meta_adj
         self.add_meta_att = add_meta_att
+        self.use_adp_adj = use_adp_adj
         if add_01_adj:
             adj = load_adj(adj_path, "pkl", adj_type)
             self.P = self.compute_cheby_poly(adj).to(device)  
@@ -441,12 +443,9 @@ class STMetaAGCRU(nn.Module):
             if self.add_meta_adj:
                 self.supports_len +=1
         else:
-            # self.P = torch.eye(self.num_nodes, device=device)
-            # self.P = torch.unsqueeze(self.P, 0)
             self.P = None
             self.supports_len = self.cheb_k
             
-
         self.node_embedding = torch.FloatTensor(np.load(node_emb_file)["data"]).to(
             device
         )
@@ -495,13 +494,6 @@ class STMetaAGCRU(nn.Module):
                         gru_hidden_dim,
                     )
                 )
-            # self.decoder = Decoder(
-            #     num_nodes=self.num_nodes,
-            #     dim_out=self.output_dim,
-            #     dim_hidden=self.gru_hidden_dim,
-            #     cheb_k=self.P.shape[0],
-            #     num_layers=self.num_layers,
-            # )
             self.proj = nn.Sequential(nn.Linear(self.gru_hidden_dim, self.output_dim))
         else:
             self.decoder = nn.Linear(gru_hidden_dim, out_steps * output_dim)
@@ -545,6 +537,9 @@ class STMetaAGCRU(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(learner_hidden_dim, 30),
             )    
+        if use_adp_adj:
+            self.adp_node_embeddings = nn.Parameter(torch.randn(self.num_nodes, 64), requires_grad=True)
+
 
 
     def compute_cheby_poly(self, P: list):
@@ -615,8 +610,13 @@ class STMetaAGCRU(nn.Module):
                 for k in range(2, self.cheb_k):
                     support_set.append(torch.matmul(2 * meta_adj, support_set[-1]) - support_set[-2])
                 self.P = torch.stack(support_set,1)
-                # print('P ', self.P.shape)
-                 
+                print(self.P)
+        if self.use_adp_adj:
+            support = F.softmax(F.relu(torch.mm(self.adp_node_embeddings, self.adp_node_embeddings.transpose(0, 1))), dim=1)
+            support_set = [torch.eye(self.num_nodes).to(x.device) , support]
+            for k in range(2, self.cheb_k):
+                support_set.append(torch.matmul(2 * support, support_set[-1]) - support_set[-2])
+            self.P = torch.stack(support_set,0)
 
         en_attention = torch.eye(num_nodes, device=x.device)
         en_attention = en_attention.expand(batch_size, *en_attention.shape) 
@@ -655,10 +655,6 @@ class STMetaAGCRU(nn.Module):
                     h_each_layer[i] = deco_input
                 deco_input = self.proj(h_each_layer[-1])
                 out.append(deco_input)
-            # for t in range(self.out_steps):
-            #     output, h_each_layer = self.decoder(self.P, deco_input, h_each_layer)
-            #     deco_input = self.proj(output)  # update decoder input
-            #     out.append(deco_input)  # T * [B, N, C]
             out = torch.stack(out, dim=1)
         else:
             out = h_each_layer[-1]  # (B, N, gru_hidden_dim) last layer last step's h
