@@ -7,8 +7,9 @@ METRLA:
   val_size: 0.1
 
   time_of_day: True
+  day_of_week: True
   
-  lr: 0.001
+  lr: 0.002
   weight_decay: 0.0001
   milestones: [80]
   clip_grad: False
@@ -20,16 +21,24 @@ METRLA:
   pass_device: True
 
   model_args:
+    device: None 
     num_nodes: 207
-    in_dim: 2
+    in_dim: 1
     out_dim: 12
     adj_path: "../data/METRLA/adj_mx.pkl"
     adj_type: "doubletransition"
-    device: null # will be updated
     dropout: 0.3
     gcn_bool: True
-    addaptadj: True
+    addaptadj: False
     aptinit: null
+    node_emb_file: "../data/METRLA/spatial_embeddings.npz"
+    tod_embedding_dim: 24
+    dow_embedding_dim: 7
+    node_embedding_dim: 64
+    learner_hidden_dim: 128
+    z_dim: 64
+    add_meta_adj: False
+    add_meta_att: True
 
 PEMSBAY:
   num_nodes: 325

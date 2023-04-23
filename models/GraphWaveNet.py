@@ -95,9 +95,19 @@ def load_adj(pkl_filename, adjtype):
 class nconv(nn.Module):
     def __init__(self):
         super(nconv,self).__init__()
+        self.meta_att = None
+
+    def set_meta_att(self, A):
+        self.meta_att = A
 
     def forward(self,x, A):
-        x = torch.einsum('ncvl,vw->ncwl',(x,A))
+        # print('x', x.shape)
+        if len(A.shape)==2:
+            x = torch.einsum('ncvl,vw->ncwl',(x,A))
+        else:
+            x = torch.einsum('ncvl,nvw->ncwl',(x,A))
+        if self.meta_att is not None:
+            x = torch.einsum('bin,bcnk->bcik',(self.meta_att,x))
         return x.contiguous()
 
 class linear(nn.Module):
@@ -116,9 +126,25 @@ class gcn(nn.Module):
         self.mlp = linear(c_in,c_out)
         self.dropout = dropout
         self.order = order
+        self.meta_adj = None
+        self.meta_att = None
+
+    def set_meta_adj(self, G):
+        self.meta_adj = G
+
+    def set_meta_att(self, A):
+        self.nconv.set_meta_att(A)
 
     def forward(self,x,support):
         out = [x]
+        if self.meta_adj is not None:
+            x1 = self.nconv(x,self.meta_adj)
+            out.append(x1)
+            for k in range(2, self.order + 1):
+                x2 = self.nconv(x1,self.meta_adj)
+                out.append(x2)
+                x1 = x2
+
         for a in support:
             x1 = self.nconv(x,a)
             out.append(x1)
@@ -126,8 +152,9 @@ class gcn(nn.Module):
                 x2 = self.nconv(x1,a)
                 out.append(x2)
                 x1 = x2
-
+        
         h = torch.cat(out,dim=1)
+        # print('h', h.shape)
         h = self.mlp(h)
         h = F.dropout(h, self.dropout, training=self.training)
         return h
@@ -143,7 +170,7 @@ class GWNET(nn.Module):
                  gcn_bool=True, 
                  addaptadj=True, 
                  aptinit=None, 
-                 in_dim=2,
+                 in_dim=1,
                  out_dim=12,
                  residual_channels=32,
                  dilation_channels=32,
@@ -151,7 +178,17 @@ class GWNET(nn.Module):
                  end_channels=512,
                  kernel_size=2,
                  blocks=4,
-                 layers=2):
+                 layers=2,
+                 add_meta_adj=False,
+                 add_meta_att=False,
+                 node_emb_file=None,
+                 tod_embedding_dim=24,
+                 dow_embedding_dim=7,
+                 node_embedding_dim=64,
+                 learner_hidden_dim=128,
+                 z_dim=32,
+                 in_steps=12
+                 ):
         super(GWNET, self).__init__()
         if adj_path:
             adj_mx = load_adj(adj_path, adj_type)
@@ -164,6 +201,15 @@ class GWNET(nn.Module):
         self.layers = layers
         self.gcn_bool = gcn_bool
         self.addaptadj = addaptadj
+
+        self.add_meta_adj = add_meta_adj
+        self.add_meta_att = add_meta_att
+        self.use_meta = self.add_meta_adj or self.add_meta_att
+        self.st_embedding_dim = (
+            tod_embedding_dim + dow_embedding_dim + node_embedding_dim
+        )
+        self.learner_hidden_dim = learner_hidden_dim
+        self.z_dim = z_dim
 
         self.filter_convs = nn.ModuleList()
         self.gate_convs = nn.ModuleList()
@@ -245,9 +291,94 @@ class GWNET(nn.Module):
 
         self.receptive_field = receptive_field
 
+        if self.use_meta:
+            self.node_embedding = torch.FloatTensor(np.load(node_emb_file)["data"]).to(device)
+
+            self.tod_onehots = torch.eye(24, device=device)
+            self.dow_onehots = torch.eye(7, device=device)  
+            
+            if self.z_dim > 0:
+                self.mu = nn.Parameter(torch.randn(num_nodes, z_dim), requires_grad=True)
+                self.logvar = nn.Parameter(
+                    torch.randn(num_nodes, z_dim), requires_grad=True
+                )
+
+                self.mu_estimator = nn.Sequential(
+                    nn.Linear(in_steps, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, z_dim),
+                )
+
+                self.logvar_estimator = nn.Sequential(
+                    nn.Linear(in_steps, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, z_dim),
+                )    
+
+            if self.add_meta_adj:
+                self.adj_learner = nn.Sequential(
+                    nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(learner_hidden_dim, 30),
+                )    
+            if self.add_meta_att:
+                self.att_learner = nn.Sequential(
+                    nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(learner_hidden_dim, 30),
+                )                
 
 
     def forward(self, input): # ! (B, C, N, T)
+        batch_size = input.shape[0]
+
+        if self.use_meta:
+            tod = input[..., 1]  # (B, T_in, N)
+            dow = input[..., 2]  # (B, T_in, N)
+            input = input[..., :1]  # (B, T_in, N, 1)
+                    # use the last time step to represent the temporal location of the time seires
+            tod_embedding = self.tod_onehots[(tod[:, -1, :] * 24).long()]  # (B, N, 24)
+            dow_embedding = self.dow_onehots[dow[:, -1, :].long()]  # (B, N, 7)
+            node_embedding = self.node_embedding.expand(
+                batch_size, *self.node_embedding.shape
+            )  # (B, N, node_emb_dim)
+            
+            meta_input = torch.concat(
+                [node_embedding, tod_embedding, dow_embedding], dim=-1
+            )  # (B, N, st_emb_dim)
+
+            if self.z_dim > 0:
+                z_input = input.squeeze(dim=-1).transpose(1, 2)
+
+                mu = self.mu_estimator(z_input)  # (B, N, z_dim)
+                logvar = self.logvar_estimator(z_input)  # (B, N, z_dim)
+
+                z_data = self.reparameterize(mu, logvar)  # temporal z (B, N, z_dim)
+                z_data = z_data + self.reparameterize(
+                    self.mu, self.logvar
+                )  # temporal z + spatial z
+                
+                meta_input = torch.concat(
+                    [meta_input, z_data], dim=-1
+                )  # (B, N, st_emb_dim+z_dim)
+
+            if self.add_meta_adj:
+                adj_embeddings = self.adj_learner(meta_input)
+                meta_adp = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [adj_embeddings, adj_embeddings.transpose(1, 2)])), dim=-1)
+                for i in range(self.blocks * self.layers):
+                    self.gconv[i].set_meta_adj(meta_adp)
+
+            if self.add_meta_att:
+                att_embeddings = self.att_learner(meta_input)
+                meta_att = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [att_embeddings, att_embeddings.transpose(1, 2)])), dim=-1)
+                for i in range(self.blocks * self.layers):
+                    self.gconv[i].set_meta_att(meta_att)               
+
+
         input = input.permute(0, 3, 2, 1)
         in_len = input.size(3)
         if in_len<self.receptive_field:
@@ -255,11 +386,11 @@ class GWNET(nn.Module):
         else:
             x = input
         x = self.start_conv(x)
-        skip = 0
+        skip = 0  
 
         # calculate the current adaptive adj matrix once per iteration
         new_supports = None
-        if self.gcn_bool and self.addaptadj and self.supports is not None:
+        if self.gcn_bool and self.addaptadj and self.supports is not None and not self.add_meta_adj:
             adp = F.softmax(F.relu(torch.mm(self.nodevec1, self.nodevec2)), dim=1)
             new_supports = self.supports + [adp]
 
@@ -298,7 +429,7 @@ class GWNET(nn.Module):
 
 
             if self.gcn_bool and self.supports is not None:
-                if self.addaptadj:
+                if self.addaptadj and not self.use_meta :
                     x = self.gconv[i](x, new_supports)
                 else:
                     x = self.gconv[i](x,self.supports)
@@ -314,4 +445,9 @@ class GWNET(nn.Module):
         x = F.relu(self.end_conv_1(x))
         x = self.end_conv_2(x) # 这里不用 permute 回去 维度顺序是正好对的
         return x
-    
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+  
