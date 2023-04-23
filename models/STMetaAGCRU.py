@@ -122,20 +122,44 @@ class STMetaGCN(nn.Module):
         self.b = nn.Parameter(torch.empty(dim_out), requires_grad=True)
         nn.init.xavier_normal_(self.W)
         nn.init.constant_(self.b, val=0)
+        self.meta_att = None
+        self.meta_adj = None
         
     def set_attention(self, A):
-        # A             (B, N, N)
-        self.A = A
+        # A             (B, N, N) 
+        self.meta_att = A
+
+    def set_meta_adj(self, G):
+        self.meta_adj = G
 
     def forward(self, G, x):
         # G             (K, N, N)
         # x             (B, N, C_IN)   
 
         support_list = list()
-        for k in range(self.cheb_k):
-            support = torch.einsum('ij,bjp->bip', [G[k,:,:], x]) # B N C_IN
-            support = torch.bmm(self.A, support)
+        K = self.cheb_k
+        if self.meta_adj is not None:
+            support = torch.einsum('bij,bjp->bip', [self.meta_adj, x]) # B N C_IN
+            support = torch.bmm(self.meta_att, support)
+            support_list.append(support)      
+            K = K - 1      
+        
+        # if self.meta_adj is not None and G is None:
+        #     node_num = support.shape[0]
+        #     support = self.meta_adj
+        #     support_list = [torch.eye(node_num).to(support.device), support]
+        #     for k in range(2, self.cheb_k):
+        #         support_list.append(torch.matmul(2 * support, support_list[-1]) - support_list[-2])  
+                   
+
+        for k in range(K):
+            if len(G.shape)==3:
+                support = torch.einsum('ij,bjp->bip', [G[k,:,:], x]) # B N C_IN
+            else:
+                support = torch.einsum('bij,bjp->bip', [G[:,k,:,:], x]) # B N C_IN
+            support = torch.bmm(self.meta_att, support)
             support_list.append(support)
+
         support_cat = torch.cat(support_list, dim=-1) # B N cheb_k*C_IN
 
         output = torch.einsum("bip,pq->biq", [support_cat, self.W]) + self.b # [B, N, H_out]
@@ -150,6 +174,14 @@ class STMetaGCRUCell(nn.Module):
         self.gru_hidden_dim = gru_hidden_dim
         self.conv_gate = STMetaGCN(dim_in=dim_in + gru_hidden_dim, dim_out=2*gru_hidden_dim, cheb_k=cheb_k)
         self.update = STMetaGCN(dim_in=dim_in + gru_hidden_dim, dim_out=gru_hidden_dim, cheb_k=cheb_k)        
+
+    def set_attention(self, A):
+        self.conv_gate.set_attention(A)
+        self.update.set_attention(A)
+
+    def set_meta_adj(self, G):
+        self.conv_gate.set_meta_adj(G)
+        self.update.set_meta_adj(G)       
 
     def forward(self, G, xt, h):
         # xt             (B, N, input_dim)
@@ -167,9 +199,6 @@ class STMetaGCRUCell(nn.Module):
 
         return h
     
-    def set_attention(self, A):
-        self.conv_gate.set_attention(A)
-        self.update.set_attention(A)
 
 class STMetaGCRUEncoder(nn.Module):
     def __init__(
@@ -192,6 +221,9 @@ class STMetaGCRUEncoder(nn.Module):
 
     def set_attention(self, A):
         self.cell.set_attention(A)
+
+    def set_meta_adj(self, G):
+        self.cell.set_meta_adj(G)
 
     def forward(self, G, x):
         # G            (K, N, N)
@@ -342,6 +374,9 @@ class STMetaGCRUDecoder(nn.Module):
     def set_attention(self, A):
         self.cell.set_attention(A)
 
+    def set_meta_adj(self, G):
+        self.cell.set_meta_adj(G)
+
     def forward(self, G, x, h):
         # G            (K, N, N)
         # x            (B, N, input_dim)
@@ -373,7 +408,10 @@ class STMetaAGCRU(nn.Module):
         num_layers=1,
         seq2seq=False,
         cheb_k=3,
-        addaptadj=False,
+        add_01_adj=True,
+        add_meta_adj=False,
+        add_meta_att=False,
+
     ):
         super(STMetaAGCRU, self).__init__()
 
@@ -392,15 +430,22 @@ class STMetaAGCRU(nn.Module):
         self.seq2seq = seq2seq
 
         self.cheb_k = cheb_k
-        adj = load_adj(adj_path, "pkl", adj_type)
-        self.P = self.compute_cheby_poly(adj).to(device)  
-
-        self.addaptadj = addaptadj
-        self.supports_len = self.P.shape[0]
-        if self.addaptadj:
-            self.nodevec1 = nn.Parameter(torch.randn(num_nodes, 10).to(device), requires_grad=True).to(device)
-            self.nodevec2 = nn.Parameter(torch.randn(10, num_nodes).to(device), requires_grad=True).to(device)
-            self.supports_len +=1
+        
+        self.add_01_adj = add_01_adj
+        self.add_meta_adj = add_meta_adj
+        self.add_meta_att = add_meta_att
+        if add_01_adj:
+            adj = load_adj(adj_path, "pkl", adj_type)
+            self.P = self.compute_cheby_poly(adj).to(device)  
+            self.supports_len = self.P.shape[0]
+            if self.add_meta_adj:
+                self.supports_len +=1
+        else:
+            # self.P = torch.eye(self.num_nodes, device=device)
+            # self.P = torch.unsqueeze(self.P, 0)
+            self.P = None
+            self.supports_len = self.cheb_k
+            
 
         self.node_embedding = torch.FloatTensor(np.load(node_emb_file)["data"]).to(
             device
@@ -482,14 +527,24 @@ class STMetaAGCRU(nn.Module):
                 nn.Tanh(),
                 nn.Linear(32, z_dim),
             )
+        if add_meta_att:
+            self.en_attention_learner = nn.Sequential(
+                nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(learner_hidden_dim, 30),
+            )
 
-        self.en_attention_learner = nn.Sequential(
-            nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
-        )
-
-        self.de_attention_learner = nn.Sequential(
-            nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
-        )
+            self.de_attention_learner = nn.Sequential(
+                nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(learner_hidden_dim, 30),
+            )
+        if add_meta_adj:
+            self.adj_learner = nn.Sequential(
+                nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(learner_hidden_dim, 30),
+            )    
 
 
     def compute_cheby_poly(self, P: list):
@@ -549,35 +604,45 @@ class STMetaAGCRU(nn.Module):
                 [meta_input, z_data], dim=-1
             )  # (B, N, st_emb_dim+z_dim)
 
-        en_embeddings = self.en_attention_learner(meta_input) # B N learner_hidden_dim
-        # en_embeddings = meta_input
+        if self.add_meta_adj:
+            adj_embeddings = self.adj_learner(meta_input)
+            meta_adj = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [adj_embeddings, adj_embeddings.transpose(1, 2)])), dim=-1)
+            if self.add_01_adj:
+                for encoder in self.encoders:
+                    encoder.set_meta_adj(meta_adj)
+            else:
+                support_set = [torch.eye(self.num_nodes).to(x.device).expand(batch_size, self.num_nodes, self.num_nodes) , meta_adj]
+                for k in range(2, self.cheb_k):
+                    support_set.append(torch.matmul(2 * meta_adj, support_set[-1]) - support_set[-2])
+                self.P = torch.stack(support_set,1)
+                # print('P ', self.P.shape)
+                 
 
-        en_attention = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [en_embeddings, en_embeddings.transpose(1, 2)])), dim=-1) # B N N 
-
+        en_attention = torch.eye(num_nodes, device=x.device)
+        en_attention = en_attention.expand(batch_size, *en_attention.shape) 
+        if self.add_meta_att:
+            en_att_embeddings = self.en_attention_learner(meta_input) # B N learner_hidden_dim
+            en_attention = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [en_att_embeddings, en_att_embeddings.transpose(1, 2)])), dim=-1) # B N N 
         for encoder in self.encoders:
             encoder.set_attention(en_attention)
 
         gru_input = x  # (B, T_in, N, 1)
         h_each_layer = []  # last step's h of each layer
-        new_support = self.P
-        # print('P shape', new_support.shape)
-        if self.addaptadj:
-            adp = F.softmax(F.relu(torch.mm(self.nodevec1, self.nodevec2)), dim=1)
-            # self.P = self.P + [adp]
-            adp = torch.unsqueeze(adp, 0)
-            # print('adp', adp.shape)
-            new_support = torch.cat((new_support, adp), 0)	
-
-        # print('P shape', new_support.shape)
 
         for encoder in self.encoders:
-            gru_input, last_h = encoder(new_support, gru_input)
+            gru_input, last_h = encoder(self.P, gru_input)
 
             h_each_layer.append(last_h)  # num_layers*(B, N, gru_hidden_dim)
 
         if self.seq2seq:
-            de_embeddings = self.de_attention_learner(meta_input) # B N learner_hidden_dim
-            de_attention = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [de_embeddings, de_embeddings.transpose(1, 2)])), dim=-1)          
+            if self.add_meta_adj:
+                for decoder in self.decoders:
+                    decoder.set_meta_adj(meta_adj)
+            de_attention = torch.eye(num_nodes, device=x.device)
+            de_attention = de_attention.expand(batch_size, *de_attention.shape) 
+            if self.add_meta_att:
+                de_embeddings = self.de_attention_learner(meta_input) # B N learner_hidden_dim
+                de_attention = F.softmax(F.relu(torch.einsum('bih,bhj->bij', [de_embeddings, de_embeddings.transpose(1, 2)])), dim=-1)          
             for decoder in self.decoders:
                 decoder.set_attention(de_attention)
             deco_input = torch.zeros(
@@ -586,7 +651,7 @@ class STMetaAGCRU(nn.Module):
             out = []
             for t in range(self.out_steps):
                 for i in range(self.num_layers):
-                    deco_input = self.decoders[i](new_support, deco_input, h_each_layer[i])
+                    deco_input = self.decoders[i](self.P, deco_input, h_each_layer[i])
                     h_each_layer[i] = deco_input
                 deco_input = self.proj(h_each_layer[-1])
                 out.append(deco_input)

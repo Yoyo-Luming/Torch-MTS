@@ -6,10 +6,10 @@ METRLA:
   time_of_day: True
   day_of_week: True
 
-  lr: 0.0001
+  lr: 0.002
   weight_decay: 0
   early_stop: 20
-  milestones: [40, 80]
+  milestones: [40, 100]
   clip_grad: False
   batch_size: 64
   max_epochs: 200
@@ -33,10 +33,13 @@ METRLA:
     dow_embedding_dim: 7
     node_embedding_dim: 64
     learner_hidden_dim: 128
-    z_dim: 32
-    num_layers: 1
-    seq2seq: False
-    cheb_k: 1
+    z_dim: 64
+    num_layers: 2
+    seq2seq: True
+    cheb_k: 3
+    add_01_adj: False
+    add_meta_adj: True
+    add_meta_att: False
 
 
 PEMSBAY:
@@ -47,9 +50,9 @@ PEMSBAY:
   time_of_day: True
   day_of_week: True
 
-  lr: 0.0001
+  lr: 0.002
   weight_d0ecay: 0
-  milestones: [40, 80]
+  milestones: [40, 100]
   clip_grad: False
   batch_size: 64
   max_epochs: 200
@@ -72,8 +75,12 @@ PEMSBAY:
     dow_embedding_dim: 7
     node_embedding_dim: 64
     learner_hidden_dim: 128
-    z_dim: 32
-    num_layers: 1
-    seq2seq: False
+    z_dim: 64
+    num_layers: 2
+    seq2seq: True
+    cheb_k: 4
+    add_01_adj: False
+    add_meta_adj: True
+    add_meta_att: False
     
   
