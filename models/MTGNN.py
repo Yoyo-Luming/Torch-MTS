@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numbers
+import numpy as np
 
 
 class graph_constructor(nn.Module):         # uni-directed: M1M2-M2M1
@@ -23,8 +24,16 @@ class graph_constructor(nn.Module):         # uni-directed: M1M2-M2M1
         self.dim = dim
         self.alpha = alpha
         self.static_feat = static_feat
-
+        self.meta_nodevec1 = None
+        self.meta_nodevec2 = None
+    
+    def set_nodevec(self, nodevec1, nodevec2):
+        self.meta_nodevec1 = nodevec1
+        self.meta_nodevec2 = nodevec2       
+        return
+        
     def forward(self, idx):
+        # print('idx:', idx.shape)
         if self.static_feat is None:
             nodevec1 = self.emb1(idx)
             nodevec2 = self.emb2(idx)
@@ -32,16 +41,28 @@ class graph_constructor(nn.Module):         # uni-directed: M1M2-M2M1
             nodevec1 = self.static_feat[idx,:]
             nodevec2 = nodevec1
 
-        nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1))
-        nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
+        if self.meta_nodevec1 is None:
+            nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1)) 
+            nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
+            a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
+            adj = F.relu(torch.tanh(self.alpha*a)) # N N 
+            mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
+            mask.fill_(float('0'))
+            s1,t1 = adj.topk(self.k,1)          # top-k sparsify
+            mask.scatter_(1,t1,s1.fill_(1))     # discretize to {0, 1}?
+            adj = adj*mask
+        else:
+            batch_size = self.meta_nodevec1.shape[0]
+            nodevec1 = torch.tanh(self.alpha*self.lin1(self.meta_nodevec1)) 
+            nodevec2 = torch.tanh(self.alpha*self.lin1(self.meta_nodevec2)) 
+            a = torch.bmm(nodevec1, nodevec2.transpose(1,2))-torch.bmm(nodevec2, nodevec1.transpose(1,2))
 
-        a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
-        adj = F.relu(torch.tanh(self.alpha*a))
-        mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
-        mask.fill_(float('0'))
-        s1,t1 = adj.topk(self.k,1)          # top-k sparsify
-        mask.scatter_(1,t1,s1.fill_(1))     # discretize to {0, 1}?
-        adj = adj*mask
+            adj = F.relu(torch.tanh(self.alpha*a)) # N N 
+            mask = torch.zeros(batch_size, idx.size(0), idx.size(0)).to(self.device)
+            mask.fill_(float('0'))
+            s1,t1 = adj.topk(self.k,2)          # top-k sparsify
+            mask.scatter_(2,t1,s1.fill_(1))     # discretize to {0, 1}?
+            adj = adj*mask
         return adj
 
 
@@ -56,11 +77,25 @@ class mixprop(nn.Module):
 
 
     def forward(self,x,adj):
-        adj = adj + torch.eye(adj.size(0)).to(x.device)
-        d = adj.sum(1)
+        # print('mixprop adj:', adj.shape)
+        if len(adj.shape) == 3:
+            batch_size = adj.shape[0]
+            num_nodes = adj.shape[1]
+            adj = adj + torch.eye(num_nodes).expand(batch_size, num_nodes, num_nodes).to(x.device)
+            d = adj.sum(2)
+            # print('d1:',d.shape)
+            d = torch.unsqueeze(d, -1)
+            # print('d2:',d.shape)
+            # a = adj / d.view(-1, 1)
+            a = torch.div(adj, d)
+            # print('a:', a.shape)
+        else:
+            adj = adj + torch.eye(adj.size(0)).to(x.device)
+            d = adj.sum(1) # N 
+            a = adj / d.view(-1, 1) # N 1
         h = x
         out = [h]
-        a = adj / d.view(-1, 1)
+        
         for i in range(self.gdep):
             h = self.alpha*x + (1-self.alpha)*self.nconv(h,a)
             out.append(h)
@@ -74,7 +109,10 @@ class nconv(nn.Module):
         super(nconv,self).__init__()
 
     def forward(self,x, A):
-        x = torch.einsum('ncwl,vw->ncvl',(x,A))
+        if len(A.shape)==2:
+            x = torch.einsum('ncvl,vw->ncwl',(x,A))
+        else:
+            x = torch.einsum('ncvl,nvw->ncwl',(x,A))
         return x.contiguous()
 
 
@@ -165,7 +203,15 @@ class MTGNN(nn.Module):
                  layers=3, 
                  propalpha=0.05, 
                  tanhalpha=3, 
-                 layer_norm_affline=True):
+                 layer_norm_affline=True,
+                 add_meta_adj=False,
+                 node_emb_file=None,
+                 tod_embedding_dim=24,
+                 dow_embedding_dim=7,
+                 node_embedding_dim=64,
+                 learner_hidden_dim=128,
+                 z_dim=32,
+                 in_steps=12):
         super(MTGNN, self).__init__()
         self.gcn_true = gcn_true
         self.buildA_true = buildA_true
@@ -182,6 +228,53 @@ class MTGNN(nn.Module):
         self.start_conv = nn.Conv2d(in_channels=in_dim,
                                     out_channels=residual_channels,
                                     kernel_size=(1, 1))
+        self.add_meta_adj = add_meta_adj
+        self.use_meta = self.add_meta_adj
+        self.st_embedding_dim = (
+            tod_embedding_dim + dow_embedding_dim + node_embedding_dim
+        )
+        self.learner_hidden_dim = learner_hidden_dim
+        self.z_dim = z_dim
+        if self.use_meta:
+            self.node_embedding = torch.FloatTensor(np.load(node_emb_file)["data"]).to(device)
+
+            self.tod_onehots = torch.eye(24, device=device)
+            self.dow_onehots = torch.eye(7, device=device)  
+            
+            if self.z_dim > 0:
+                self.mu = nn.Parameter(torch.randn(num_nodes, z_dim), requires_grad=True)
+                self.logvar = nn.Parameter(
+                    torch.randn(num_nodes, z_dim), requires_grad=True
+                )
+
+                self.mu_estimator = nn.Sequential(
+                    nn.Linear(in_steps, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, z_dim),
+                )
+
+                self.logvar_estimator = nn.Sequential(
+                    nn.Linear(in_steps, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, 32),
+                    nn.Tanh(),
+                    nn.Linear(32, z_dim),
+                )    
+
+            if self.add_meta_adj:
+                self.adj_learner1 = nn.Sequential(
+                    nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(learner_hidden_dim, node_dim),
+                ) 
+                self.adj_learner2 = nn.Sequential(
+                    nn.Linear(self.st_embedding_dim + z_dim, learner_hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(learner_hidden_dim, node_dim),
+                )  
+
         self.gc = graph_constructor(num_nodes, subgraph_size, node_dim, device, alpha=tanhalpha, static_feat=static_feat)
 
         self.seq_length = seq_length
@@ -249,6 +342,44 @@ class MTGNN(nn.Module):
 
 
     def forward(self, input, idx=None):
+        batch_size = input.shape[0]
+
+        if self.use_meta:
+            tod = input[..., 1]  # (B, T_in, N)
+            dow = input[..., 2]  # (B, T_in, N)
+            input = input[..., :2]  # (B, T_in, N, 1)
+                    # use the last time step to represent the temporal location of the time seires
+            x = input[..., :1]
+            tod_embedding = self.tod_onehots[(tod[:, -1, :] * 24).long()]  # (B, N, 24)
+            dow_embedding = self.dow_onehots[dow[:, -1, :].long()]  # (B, N, 7)
+            node_embedding = self.node_embedding.expand(
+                batch_size, *self.node_embedding.shape
+            )  # (B, N, node_emb_dim)
+            
+            meta_input = torch.concat(
+                [node_embedding, tod_embedding, dow_embedding], dim=-1
+            )  # (B, N, st_emb_dim)
+
+            if self.z_dim > 0:
+                z_input = x.squeeze(dim=-1).transpose(1, 2)
+
+                mu = self.mu_estimator(z_input)  # (B, N, z_dim)
+                logvar = self.logvar_estimator(z_input)  # (B, N, z_dim)
+
+                z_data = self.reparameterize(mu, logvar)  # temporal z (B, N, z_dim)
+                z_data = z_data + self.reparameterize(
+                    self.mu, self.logvar
+                )  # temporal z + spatial z
+                
+                meta_input = torch.concat(
+                    [meta_input, z_data], dim=-1
+                )  # (B, N, st_emb_dim+z_dim)
+
+            if self.add_meta_adj:
+                meta_nodevec1 = self.adj_learner1(meta_input)
+                meta_nodevec2 = self.adj_learner2(meta_input)
+                self.gc.set_nodevec(meta_nodevec1, meta_nodevec2)
+
         input = input.permute(0, 3, 2, 1)
         seq_len = input.size(3)
         assert seq_len==self.seq_length, 'input sequence length not equal to preset sequence length'
@@ -279,7 +410,10 @@ class MTGNN(nn.Module):
             s = self.skip_convs[i](s)
             skip = s + skip
             if self.gcn_true:
-                x = self.gconv1[i](x, adp)+self.gconv2[i](x, adp.transpose(1,0))
+                if self.add_meta_adj:
+                    x = self.gconv1[i](x, adp)+self.gconv2[i](x, adp.transpose(1,2))
+                else:
+                    x = self.gconv1[i](x, adp)+self.gconv2[i](x, adp.transpose(1,0))
             else:
                 x = self.residual_convs[i](x)
 
@@ -294,3 +428,8 @@ class MTGNN(nn.Module):
         x = F.relu(self.end_conv_1(x))
         x = self.end_conv_2(x)
         return x
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
